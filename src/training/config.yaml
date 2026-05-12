@@ -1,0 +1,210 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Multilingual African Health Assistant — Training Configuration
+#  Zindi ITU Challenge: Multilingual Health QA in Low-Resource African Languages
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Reproducibility ──────────────────────────────────────────────────────────
+seed: 42
+deterministic: true
+
+# ─── Project Paths ────────────────────────────────────────────────────────────
+paths:
+  data_raw:        "data/raw"
+  data_cleaned:    "data/cleaned"
+  data_augmented:  "data/augmented"
+  data_external:   "data/external"
+  models:          "models/checkpoints"
+  submissions:     "submissions"
+  reports:         "reports"
+  logs:            "logs"
+
+# ─── Dataset ──────────────────────────────────────────────────────────────────
+dataset:
+  train_file:   "data/augmented/final_train.csv"
+  val_file:     "data/cleaned/val_clean.csv"
+  test_file:    "data/raw/Test.csv"
+  id_col:       "ID"
+  input_col:    "input"
+  output_col:   "output"
+  subset_col:   "subset"
+  languages:
+    - Eng_Uga    # English — Uganda
+    - Aka_Gha    # Akan (Twi) — Ghana
+    - Eng_Gha    # English — Ghana
+    - Eng_Eth    # English — Ethiopia
+    - Lug_Uga    # Luganda — Uganda
+    - Eng_Ken    # English — Kenya
+    - Swa_Ken    # Swahili — Kenya
+    - Amh_Eth    # Amharic — Ethiopia
+
+# ─── Language → NLLB BCP-47 Mapping ──────────────────────────────────────────
+nllb_codes:
+  Eng_Uga: "eng_Latn"
+  Aka_Gha: "aka_Latn"
+  Eng_Gha: "eng_Latn"
+  Eng_Eth: "eng_Latn"
+  Lug_Uga: "lug_Latn"
+  Eng_Ken: "eng_Latn"
+  Swa_Ken: "swh_Latn"
+  Amh_Eth: "amh_Ethi"
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+model:
+  # Options: google/mt5-base | google/mt5-large | castorini/afriteva-v2
+  #          facebook/nllb-200-1.3B | bigscience/bloom-1b7
+  base_model:        "castorini/afriteva-v2"
+  task_prefix:       "Answer in {language}: "
+  max_input_length:  256
+  max_output_length: 512
+
+# ─── LoRA (PEFT) — applied when params >= 1B ──────────────────────────────────
+lora:
+  enabled:         true      # auto-set based on model size in train.py
+  r:               16
+  lora_alpha:      32
+  lora_dropout:    0.1
+  target_modules:  ["q", "v"]
+  bias:            "none"
+  task_type:       "SEQ_2_SEQ_LM"
+
+# ─── Optimiser ────────────────────────────────────────────────────────────────
+optimiser:
+  type:            "adamw_torch"
+  lr:              2.0e-4    # 5e-5 for full fine-tune, 2e-4 for LoRA
+  weight_decay:    0.01
+  lr_scheduler:    "cosine"
+  warmup_ratio:    0.05
+  label_smoothing: 0.1
+
+# ─── Training Loop ────────────────────────────────────────────────────────────
+training:
+  epochs:                  10
+  early_stopping_patience: 3
+  early_stopping_metric:   "eval_rouge_l"
+  per_device_train_batch:  16
+  per_device_eval_batch:   16
+  gradient_accumulation:   4          # effective batch = 64
+  mixed_precision:         "bf16"     # bf16 (A100/H100) | fp16 (V100) | no (CPU)
+  gradient_checkpointing:  true
+  dataloader_num_workers:  4
+  logging_steps:           50
+  eval_strategy:           "epoch"
+  save_strategy:           "epoch"
+  save_total_limit:        3          # keep best 3 checkpoints
+  load_best_model_at_end:  true
+  metric_for_best_model:   "eval_rouge_l"
+
+# ─── Curriculum Learning ──────────────────────────────────────────────────────
+curriculum:
+  enabled:         true
+  phase1_epochs:   2          # train only on Eng + Swa_Eas
+  phase1_langs:    ["Eng_Uga", "Aka_Gha", "Eng_Gha"]   # top 3 by size
+  phase2_epoch:    3          # introduce all languages from epoch 3
+
+# ─── Temperature Sampling (data mixing) ───────────────────────────────────────
+temperature_sampling:
+  enabled:       true
+  temperature:   5.0         # higher T → more uniform sampling across languages
+
+# ─── Augmentation ─────────────────────────────────────────────────────────────
+augmentation:
+  target_ratio:
+    Eng_Uga: 1.0    # 7,624 rows — largest, no boost needed
+    Aka_Gha: 1.7    # 4,455 rows
+    Eng_Gha: 1.7    # 4,443 rows
+    Eng_Eth: 2.0    # 3,915 rows
+    Lug_Uga: 2.2    # 3,383 rows — low resource
+    Eng_Ken: 3.0    # 2,080 rows — needs boosting
+    Swa_Ken: 3.0    # 2,070 rows — needs boosting
+    Amh_Eth: 4.0    # 1,845 rows — lowest, most boost
+  chrf_threshold:     0.35
+  semantic_cos_threshold: 0.30
+  length_ratio_min:   0.5
+  length_ratio_max:   20.0
+
+# ─── Translation (NLLB-200) ───────────────────────────────────────────────────
+translation:
+  model_name:    "facebook/nllb-200-3.3B"
+  num_beams:     5
+  batch_size:    32
+  max_length:    512
+
+# ─── Decoding (Inference) ────────────────────────────────────────────────────
+decoding:
+  # Best per-language config discovered via decode_search.py
+  default:
+    num_beams:        8
+    length_penalty:   0.8
+    no_repeat_ngram:  3
+    min_length:       10
+  per_language:
+    Aka_Gha:
+      num_beams:      6
+      length_penalty: 1.0
+      no_repeat_ngram: 3
+    Amh_Eth:
+      num_beams:      8
+      length_penalty: 0.8
+      no_repeat_ngram: 2
+    Lug_Uga:
+      num_beams:      6
+      length_penalty: 1.0
+      no_repeat_ngram: 3
+    Swa_Ken:
+      num_beams:      8
+      length_penalty: 0.8
+      no_repeat_ngram: 3
+    Eng_Uga:
+      num_beams:      8
+      length_penalty: 0.6
+      no_repeat_ngram: 4
+
+# ─── Evaluation ───────────────────────────────────────────────────────────────
+evaluation:
+  rouge_types:         ["rouge1", "rougeL"]
+  metric_weights:
+    rouge1_f1:  0.37
+    rougeL_f1:  0.37
+    llm_judge:  0.26
+  judge_model:         "mistralai/Mistral-7B-Instruct-v0.2"
+  judge_prompt: |
+    You are an expert evaluator for multilingual health question-answering systems.
+    Question: {question}
+    Reference Answer: {reference}
+    Model Answer: {prediction}
+    Rate the model answer on a scale of 1–5 for:
+    - Accuracy: medical correctness and safety
+    - Completeness: addresses the full question
+    - Language: grammatically natural and fluent in the question's language
+    Respond with a JSON object: {{"accuracy": X, "completeness": X, "language": X, "overall": X}}
+
+# ─── Serving ─────────────────────────────────────────────────────────────────
+serving:
+  host:            "0.0.0.0"
+  port:            8000
+  rate_limit:      "100/minute"
+  log_retention_days: 30
+  encryption:      "AES-256"
+  disclaimer:
+    Eng_Uga: "This answer is for informational purposes only. Please consult a qualified health professional."
+    Eng_Gha: "This answer is for informational purposes only. Please consult a qualified health professional."
+    Eng_Eth: "This answer is for informational purposes only. Please consult a qualified health professional."
+    Eng_Ken: "This answer is for informational purposes only. Please consult a qualified health professional."
+    Aka_Gha: "Nsɛm yi yɛ nsɛm a wɔde ho kɔ adwene mu nko ara. Fa wo ho kɔ onyansafo okra ho adwene."
+    Amh_Eth: "ይህ መልስ ለመረጃ ዓላማ ብቻ ነው። እባክዎ ለሕክምና ምክር ብቁ ጤና ባለሙያ ያነጋግሩ።"
+    Lug_Uga: "Okuddamu kuno kwe kulaga amawulire bukabu. Ndowooza ogende gy'omudaala omanyi."
+    Swa_Ken: "Jibu hili ni kwa madhumuni ya habari tu. Tafadhali wasiliana na mtaalamu wa afya."
+
+# ─── MLflow / W&B ────────────────────────────────────────────────────────────
+tracking:
+  backend:       "mlflow"     # mlflow | wandb
+  experiment:    "african-health-qa"
+  run_name:      "afriteva-v2-lora-curriculum"
+
+# ─── Monitoring ──────────────────────────────────────────────────────────────
+monitoring:
+  canary_set_size:       200
+  canary_eval_schedule:  "weekly"
+  degradation_threshold: 0.10   # 10% relative drop triggers alert
+  flag_threshold_weekly: 50
+  rouge_drop_threshold:  0.05

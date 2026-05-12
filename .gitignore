@@ -1,0 +1,41 @@
+# ── Data (raw / large files) ──────────────────────────────────────────────
+data/raw/*.csv
+data/augmented/
+models/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Environment ───────────────────────────────────────────────────────────
+.env
+*.env.local
+.env.*
+
+# ── Logs / Caches ─────────────────────────────────────────────────────────
+logs/
+*.log
+.cache/
+.mlflow/
+mlruns/
+wandb/
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

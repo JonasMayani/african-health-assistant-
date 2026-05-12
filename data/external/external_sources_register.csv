@@ -1,0 +1,4 @@
+source_name,description,licence,url,language,records_before_dedup,records_after_dedup,filtering_criteria
+AmHQA,Amharic health Q&A pairs translated from NIH MedQuAD,CC-BY,https://data.mendeley.com/datasets/amhqa,Amh_Eth,1600,1587,MSRH-relevant categories only
+WHO_MSRH_FAQs,Official WHO maternal/reproductive health FAQ pages,CC-BY,https://www.who.int/health-topics/maternal-health,Eng,500,498,Maternal and reproductive health topics
+MedQuAD_MSRH,NIH MedQuAD MSRH-relevant subset,CC-BY-NC,https://github.com/abachaa/MedQuAD,Eng,2100,2048,Categories: pregnancy contraception reproductive STI

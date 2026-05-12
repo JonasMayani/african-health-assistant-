@@ -1,0 +1,78 @@
+name: CI — Test, Lint & Evaluate
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ─── Lint & Type Check ────────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff mypy
+      - run: ruff check src/ notebooks/
+      - run: mypy src/ --ignore-missing-imports
+
+  # ─── Unit Tests ───────────────────────────────────────────────────────────
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -v --tb=short
+
+  # ─── Data Pipeline Tests (CPU-only, no model weights needed) ─────────────
+  data-pipeline:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install pandas numpy pyyaml loguru rouge-score
+      - name: Run EDA (synthetic data)
+        run: python notebooks/01_eda.py
+      - name: Run data cleaning (synthetic data)
+        run: python src/data/clean.py
+      - name: Upload EDA artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: eda-reports
+          path: reports/
+
+  # ─── Evaluation on Val set (runs only on main branch) ────────────────────
+  evaluate:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: data-pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - name: Download model checkpoint
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download('your-org/african-health-qa-v1',
+                            local_dir='models/checkpoints/best',
+                            token='$HF_TOKEN')
+          "
+      - name: Run ROUGE evaluation
+        run: python src/evaluation/metrics.py
+      - name: Upload evaluation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-results
+          path: reports/evaluation_results.csv
