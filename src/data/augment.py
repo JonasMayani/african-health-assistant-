@@ -29,7 +29,6 @@ from tqdm.auto import tqdm
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
-    pipeline,
 )
 
 # ─── Lazy Model Cache ─────────────────────────────────────────────────────────
@@ -59,11 +58,17 @@ def _get_paraphrase_model():
     key = "paraphrase"
     if key not in _models:
         logger.info("Loading T5 paraphrase model …")
-        _models[key] = pipeline(
-            "text2text-generation",
-            model="Vamsi/t5_paraphrase_paws",
-            device=0 if torch.cuda.is_available() else -1,
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        model_name = "Vamsi/t5_paraphrase_paws"
+        para_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        para_model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         )
+        if torch.cuda.is_available():
+            para_model = para_model.cuda()
+        para_model.eval()
+        _models[key] = (para_model, para_tokenizer)
     return _models[key]
 
 
@@ -221,7 +226,7 @@ def back_translate_and_paraphrase(
     num_beams  = nllb_cfg["num_beams"]
     batch_size = nllb_cfg["batch_size"]
 
-    paraphraser = _get_paraphrase_model()
+    para_model, para_tokenizer = _get_paraphrase_model()
     rows: list[dict] = []
 
     for subset_tag, group in df.groupby("subset"):
@@ -240,13 +245,23 @@ def back_translate_and_paraphrase(
         paraphrased_en: list[str] = []
         for text in tqdm(inputs_en, desc=f"Paraphrasing {subset_tag}"):
             try:
-                result = paraphraser(
+                input_ids = para_tokenizer(
                     f"paraphrase: {text} </s>",
+                    return_tensors="pt",
                     max_length=256,
-                    num_return_sequences=1,
-                    do_sample=True,
-                    temperature=1.5,
-                )[0]["generated_text"]
+                    truncation=True,
+                ).input_ids
+                if torch.cuda.is_available():
+                    input_ids = input_ids.cuda()
+                with torch.no_grad():
+                    outputs = para_model.generate(
+                        input_ids,
+                        max_new_tokens=256,
+                        do_sample=True,
+                        temperature=1.5,
+                        num_return_sequences=1,
+                    )
+                result = para_tokenizer.decode(outputs[0], skip_special_tokens=True)
                 paraphrased_en.append(result)
             except Exception:
                 paraphrased_en.append(text)  # fallback: keep original
@@ -342,7 +357,7 @@ def load_external_sources(external_dir: Path) -> pd.DataFrame:
 
 def run_augmentation(config_path: str = "src/training/config.yaml") -> None:
     """End-to-end augmentation pipeline."""
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     paths       = cfg["paths"]
@@ -381,7 +396,7 @@ def run_augmentation(config_path: str = "src/training/config.yaml") -> None:
         logger.info(f"Running forward translation on {len(df_english)} English pairs …")
         df_fwd = forward_translate(
             df_english=df_english,
-            target_langs={k: v for k, v in nllb_codes.items() if k != "Eng"},
+            target_langs={k: v for k, v in nllb_codes.items() if k not in ("Eng_Uga","Eng_Gha","Eng_Eth","Eng_Ken")},
             cfg=cfg,
         )
         # Convert to standard columns

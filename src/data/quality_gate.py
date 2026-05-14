@@ -190,7 +190,7 @@ def gate_semantic_relevance(
 
 def run_quality_gate(config_path: str = "src/training/config.yaml") -> None:
     """Apply all quality gates to the augmented training set."""
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     paths   = cfg["paths"]

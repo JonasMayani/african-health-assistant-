@@ -74,7 +74,7 @@ def score_predictions(predictions: list[str], references: list[str]) -> float:
 
 
 def run_decode_search(config_path: str = "src/training/config.yaml") -> None:
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     paths     = cfg["paths"]

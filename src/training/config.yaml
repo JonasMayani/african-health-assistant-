@@ -81,10 +81,10 @@ training:
   epochs:                  10
   early_stopping_patience: 3
   early_stopping_metric:   "eval_rouge_l"
-  per_device_train_batch:  16
-  per_device_eval_batch:   16
+  per_device_train_batch:  8
+  per_device_eval_batch:   8
   gradient_accumulation:   4          # effective batch = 64
-  mixed_precision:         "bf16"     # bf16 (A100/H100) | fp16 (V100) | no (CPU)
+  mixed_precision:         "fp16"     # bf16 (A100/H100) | fp16 (V100) | no (CPU)
   gradient_checkpointing:  true
   dataloader_num_workers:  4
   logging_steps:           50
@@ -124,7 +124,7 @@ augmentation:
 
 # ─── Translation (NLLB-200) ───────────────────────────────────────────────────
 translation:
-  model_name:    "facebook/nllb-200-3.3B"
+  model_name:    "facebook/nllb-200-distilled-600M"
   num_beams:     5
   batch_size:    32
   max_length:    512

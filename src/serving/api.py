@@ -41,7 +41,7 @@ from slowapi.errors import RateLimitExceeded
 # ─── App Initialisation ───────────────────────────────────────────────────────
 
 CONFIG_PATH = Path("src/training/config.yaml")
-with open(CONFIG_PATH) as f:
+with open(config_path, encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 SERVING_CFG  = CFG["serving"]
