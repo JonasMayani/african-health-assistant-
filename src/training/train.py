@@ -63,6 +63,18 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+class SafeSeq2SeqCollator(DataCollatorForSeq2Seq):
+    """
+    Wraps DataCollatorForSeq2Seq to prevent the M2M100/NLLB architecture
+    bug where both decoder_input_ids and decoder_inputs_embeds are passed
+    simultaneously, causing a ValueError in forward().
+    """
+    def __call__(self, features, return_tensors=None):
+        batch = super().__call__(features, return_tensors=return_tensors)
+        # If both are present, drop decoder_inputs_embeds — input_ids takes priority
+        if "decoder_input_ids" in batch and "decoder_inputs_embeds" in batch:
+            del batch["decoder_inputs_embeds"]
+        return batch
 
 # ─── Metric Utils ────────────────────────────────────────────────────────────
 
@@ -192,26 +204,48 @@ def count_parameters(model) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def gpu_total_memory_gb() -> Optional[float]:
+    """Return total GPU memory in GB for the first CUDA device, or None."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(0)
+        return props.total_memory / 1024 ** 3
+    except Exception:
+        return None
+
+
 # ─── Compute Metrics Callback ─────────────────────────────────────────────────
 
 def make_compute_metrics(tokenizer, df_val: pd.DataFrame):
     """Factory: returns a compute_metrics fn that reports per-language ROUGE."""
+    
     def compute_metrics(eval_pred):
+        # Everything below MUST be indented inside this function
         predictions, labels = eval_pred
-        # Replace -100 (padding) with pad_token_id
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        
+        # 1. Handle cases where predictions is a tuple
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
 
+        # 2. Clean the labels (Replace -100 with Pad ID)
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        
+        # 3. Clean the predictions
+        predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
+
+        # 4. Decode the CLEANED variables
         decoded_preds  = tokenizer.batch_decode(predictions, skip_special_tokens=True)
         decoded_labels = tokenizer.batch_decode(labels,      skip_special_tokens=True)
 
-        # Strip whitespace
+        # 5. Strip whitespace
         decoded_preds  = [p.strip() for p in decoded_preds]
         decoded_labels = [l.strip() for l in decoded_labels]
 
-        # Overall ROUGE
+        # 6. Overall ROUGE
         overall = compute_rouge(decoded_preds, decoded_labels)
 
-        # Per-language ROUGE
+        # 7. Per-language ROUGE
         subsets = df_val["subset"].values
         metrics = {**overall}
         for lang in set(subsets):
@@ -226,6 +260,7 @@ def make_compute_metrics(tokenizer, df_val: pd.DataFrame):
 
         return {"eval_rouge_l": overall["rougeL_f1"], **metrics}
 
+    # This return stays outside compute_metrics but inside make_compute_metrics
     return compute_metrics
 
 
@@ -241,11 +276,24 @@ def train(cfg: dict, base_model_override: Optional[str] = None) -> None:
 
     paths      = cfg["paths"]
     model_cfg  = cfg["model"]
-    train_cfg  = cfg["training"]
+    train_cfg  = cfg["training"].copy()
     opt_cfg    = cfg["optimiser"]
     lora_cfg   = cfg["lora"]
     curr_cfg   = cfg["curriculum"]
     track_cfg  = cfg["tracking"]
+
+    gpu_memory_gb = gpu_total_memory_gb()
+    if gpu_memory_gb is not None and gpu_memory_gb <= 8.0:
+        logger.warning(
+            "Detected %.1fGB GPU memory. Enforcing safer training settings for 8GB VRAM.",
+            gpu_memory_gb,
+        )
+        train_cfg["per_device_train_batch"] = min(train_cfg["per_device_train_batch"], 2)
+        train_cfg["per_device_eval_batch"] = min(train_cfg["per_device_eval_batch"], 2)
+        train_cfg["gradient_accumulation"] = max(train_cfg["gradient_accumulation"], 8)
+        train_cfg["dataloader_num_workers"] = min(train_cfg["dataloader_num_workers"], 1)
+        train_cfg["mixed_precision"] = "fp16"
+
 
     base_model = base_model_override or model_cfg["base_model"]
     output_dir = Path(paths["models"]) / base_model.replace("/", "_")
@@ -266,7 +314,7 @@ def train(cfg: dict, base_model_override: Optional[str] = None) -> None:
 
     # Auto-select LoRA vs full fine-tune based on param count
     n_params = count_parameters(model)
-    use_lora = lora_cfg["enabled"] and n_params >= 1e9 and PEFT_AVAILABLE
+    use_lora = lora_cfg["enabled"] and PEFT_AVAILABLE
     logger.info(f"Model parameters: {n_params/1e6:.0f}M  |  LoRA: {use_lora}")
     if use_lora:
         model = apply_lora(model, lora_cfg)
@@ -312,6 +360,13 @@ def train(cfg: dict, base_model_override: Optional[str] = None) -> None:
             cfg=cfg,
         )
 
+        total_steps = (len(dataset["train"]) // 
+              (train_cfg["per_device_train_batch"] * 
+               train_cfg["gradient_accumulation"])) * phase_epochs
+        
+        warmup_steps = int(total_steps * opt_cfg["warmup_ratio"])
+
+
         training_args = Seq2SeqTrainingArguments(
             output_dir=str(output_dir),
             num_train_epochs=phase_epochs,
@@ -321,7 +376,7 @@ def train(cfg: dict, base_model_override: Optional[str] = None) -> None:
             learning_rate=lr,
             weight_decay=opt_cfg["weight_decay"],
             lr_scheduler_type=opt_cfg["lr_scheduler"],
-            warmup_ratio=opt_cfg["warmup_ratio"],
+            warmup_steps=warmup_steps,
             label_smoothing_factor=opt_cfg["label_smoothing"],
             bf16=train_cfg["mixed_precision"] == "bf16",
             fp16=train_cfg["mixed_precision"] == "fp16",
@@ -329,7 +384,7 @@ def train(cfg: dict, base_model_override: Optional[str] = None) -> None:
             predict_with_generate=True,
             generation_max_length=model_cfg["max_output_length"],
             logging_steps=train_cfg["logging_steps"],
-            evaluation_strategy=train_cfg["eval_strategy"],
+            eval_strategy=train_cfg["eval_strategy"],
             save_strategy=train_cfg["save_strategy"],
             save_total_limit=train_cfg["save_total_limit"],
             load_best_model_at_end=train_cfg["load_best_model_at_end"],
@@ -340,16 +395,20 @@ def train(cfg: dict, base_model_override: Optional[str] = None) -> None:
             report_to=track_cfg["backend"] if track_cfg["backend"] in ("wandb",) else "none",
         )
 
-        data_collator = DataCollatorForSeq2Seq(
-            tokenizer, model=model, padding=True, label_pad_token_id=-100
+        data_collator = SafeSeq2SeqCollator(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100 # Standard for ignoring padding in loss
         )
+
 
         trainer = Seq2SeqTrainer(
             model=model,
             args=training_args,
             train_dataset=dataset["train"],
             eval_dataset=dataset["validation"],
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=data_collator,
             compute_metrics=make_compute_metrics(tokenizer, df_val),
             callbacks=[
@@ -384,6 +443,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    with open(args.config) as f:
+    with open(args.config, "r", encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     train(cfg, base_model_override=args.base_model)

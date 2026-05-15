@@ -52,10 +52,10 @@ nllb_codes:
 model:
   # Options: google/mt5-base | google/mt5-large | castorini/afriteva-v2
   #          facebook/nllb-200-1.3B | bigscience/bloom-1b7
-  base_model:        "castorini/afriteva-v2"
+  base_model:        "google/mt5-base"
   task_prefix:       "Answer in {language}: "
   max_input_length:  256
-  max_output_length: 512
+  max_output_length: 384
 
 # ─── LoRA (PEFT) — applied when params >= 1B ──────────────────────────────────
 lora:
@@ -81,12 +81,12 @@ training:
   epochs:                  10
   early_stopping_patience: 3
   early_stopping_metric:   "eval_rouge_l"
-  per_device_train_batch:  8
-  per_device_eval_batch:   8
-  gradient_accumulation:   4          # effective batch = 64
-  mixed_precision:         "fp16"     # bf16 (A100/H100) | fp16 (V100) | no (CPU)
+  per_device_train_batch:  4        # safe for 8GB GPU with fp16 and gradient checkpointing
+  per_device_eval_batch:   4
+  gradient_accumulation:   16        # effective batch = 32
+  mixed_precision:         "fp16"     # bf16 (A100/H100) | fp16 (V100 / 8GB GPUs) | no (CPU)
   gradient_checkpointing:  true
-  dataloader_num_workers:  4
+  dataloader_num_workers:  0
   logging_steps:           50
   eval_strategy:           "epoch"
   save_strategy:           "epoch"
@@ -125,9 +125,9 @@ augmentation:
 # ─── Translation (NLLB-200) ───────────────────────────────────────────────────
 translation:
   model_name:    "facebook/nllb-200-distilled-600M"
-  num_beams:     5
-  batch_size:    32
-  max_length:    512
+  num_beams:     4
+  batch_size:    8
+  max_length:    384
 
 # ─── Decoding (Inference) ────────────────────────────────────────────────────
 decoding:

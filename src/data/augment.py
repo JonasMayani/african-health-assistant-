@@ -72,6 +72,33 @@ def _get_paraphrase_model():
     return _models[key]
 
 
+def _safe_translation_batch_size(cfg: dict) -> int:
+    """Return a lower batch size when GPU memory is limited to avoid OOM."""
+    default = cfg["translation"]["batch_size"]
+    if not torch.cuda.is_available():
+        return default
+    try:
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        if total_gb <= 8.0:
+            return min(default, 8)
+    except Exception:
+        pass
+    return default
+
+
+def _normalize_text_batch(texts: list[str]) -> list[str]:
+    """Ensure translation inputs are valid strings for the tokenizer."""
+    normalized: list[str] = []
+    for text in texts:
+        if isinstance(text, str):
+            normalized.append(text)
+        elif text is None or (isinstance(text, float) and np.isnan(text)):
+            normalized.append("")
+        else:
+            normalized.append(str(text))
+    return normalized
+
+
 # ─── Translation Utils ────────────────────────────────────────────────────────
 
 def translate_batch(
@@ -97,7 +124,7 @@ def translate_batch(
     translations: list[str] = []
 
     for i in tqdm(range(0, len(texts), batch_size), desc=f"Translating {src_lang}→{tgt_lang}"):
-        batch = texts[i : i + batch_size]
+        batch = _normalize_text_batch(texts[i : i + batch_size])
         inputs = tokenizer(
             batch,
             return_tensors="pt",
@@ -161,7 +188,7 @@ def forward_translate(
     nllb_cfg   = cfg["translation"]
     model_name = nllb_cfg["model_name"]
     num_beams  = nllb_cfg["num_beams"]
-    batch_size = nllb_cfg["batch_size"]
+    batch_size = _safe_translation_batch_size(cfg)
     chrf_thr   = cfg["augmentation"]["chrf_threshold"]
 
     rows: list[dict] = []
@@ -224,16 +251,17 @@ def back_translate_and_paraphrase(
     nllb_cfg   = cfg["translation"]
     model_name = nllb_cfg["model_name"]
     num_beams  = nllb_cfg["num_beams"]
-    batch_size = nllb_cfg["batch_size"]
+    batch_size = _safe_translation_batch_size(cfg)
 
     para_model, para_tokenizer = _get_paraphrase_model()
     rows: list[dict] = []
 
     for subset_tag, group in df.groupby("subset"):
-        if subset_tag == "Eng" or subset_tag not in nllb_codes:
+        if subset_tag not in nllb_codes:
             continue
-
         tgt_lang = nllb_codes[subset_tag]
+        if tgt_lang == "eng_Latn":
+            continue
         logger.info(f"Back-translating {subset_tag} ({len(group)} pairs) …")
 
         # Step 1: Translate African → English
@@ -349,8 +377,27 @@ def load_external_sources(external_dir: Path) -> pd.DataFrame:
 
     merged = pd.concat(frames, ignore_index=True)
     merged["source"] = merged.get("source", "external")
+
+    required = ["input", "output", "subset"]
+    invalid = merged[required].isna().any(axis=1)
+    if invalid.any():
+        logger.warning(
+            "Dropping %d invalid external rows missing input/output/subset.",
+            invalid.sum(),
+        )
+        merged = merged.loc[~invalid].reset_index(drop=True)
+
+    merged["input"] = merged["input"].astype(str)
+    merged["output"] = merged["output"].astype(str)
+    merged["subset"] = merged["subset"].astype(str)
+
     logger.success(f"Loaded {len(merged)} rows from {len(frames)} external sources.")
     return merged
+
+
+def _checkpoint_path(augmented_dir: Path, name: str) -> Path:
+    """Build a checkpoint path inside the augmented data directory."""
+    return augmented_dir / f"checkpoint_{name}.csv"
 
 
 # ─── Main Augmentation Runner ─────────────────────────────────────────────────
@@ -382,6 +429,15 @@ def run_augmentation(config_path: str = "src/training/config.yaml") -> None:
 
     df_train = pd.read_csv(train_path)
     df_train["source"] = df_train.get("source", "original")
+    invalid_mask = df_train["input"].isna() | df_train["output"].isna()
+    if invalid_mask.any():
+        logger.warning(
+            "Dropping %d rows with missing input/output before augmentation.",
+            invalid_mask.sum(),
+        )
+        df_train = df_train.loc[~invalid_mask].reset_index(drop=True)
+    df_train["input"] = df_train["input"].astype(str)
+    df_train["output"] = df_train["output"].astype(str)
     logger.info(f"Loaded {len(df_train)} clean training rows.")
 
     # Load external sources
@@ -390,27 +446,56 @@ def run_augmentation(config_path: str = "src/training/config.yaml") -> None:
         df_train = pd.concat([df_train, df_external], ignore_index=True)
         logger.info(f"After external integration: {len(df_train)} rows.")
 
+    forward_path = _checkpoint_path(augmented_dir, "forward_translate")
+    back_path = _checkpoint_path(augmented_dir, "back_translate")
+    final_path = augmented_dir / "augmented_train.csv"
+
+    if final_path.exists():
+        logger.success(
+            "Final augmented dataset already exists at %s. "
+            "Delete it to regenerate or keep using the existing file.",
+            final_path,
+        )
+        return
+
     # Forward translation (English → African languages)
     df_english = df_train[df_train["subset"] == "Eng"].copy()
     if not df_english.empty:
-        logger.info(f"Running forward translation on {len(df_english)} English pairs …")
-        df_fwd = forward_translate(
-            df_english=df_english,
-            target_langs={k: v for k, v in nllb_codes.items() if k not in ("Eng_Uga","Eng_Gha","Eng_Eth","Eng_Ken")},
-            cfg=cfg,
-        )
-        # Convert to standard columns
-        df_fwd = df_fwd.rename(columns={
-            "input_translated":  "input",
-            "output_translated": "output",
-            "language":          "subset",
-        })[["input", "output", "subset", "source"]]
+        if forward_path.exists():
+            logger.info(f"Resuming from existing forward translation checkpoint: {forward_path}")
+            df_fwd = pd.read_csv(forward_path)
+        else:
+            logger.info(f"Running forward translation on {len(df_english)} English pairs …")
+            df_fwd = forward_translate(
+                df_english=df_english,
+                target_langs={k: v for k, v in nllb_codes.items() if k not in ("Eng_Uga","Eng_Gha","Eng_Eth","Eng_Ken")},
+                cfg=cfg,
+            )
+            df_fwd = df_fwd.rename(columns={
+                "input_translated":  "input",
+                "output_translated": "output",
+                "language":          "subset",
+            })[["input", "output", "subset", "source"]]
+            df_fwd.to_csv(forward_path, index=False)
+            logger.success(f"Saved forward translation checkpoint → {forward_path}")
+
+        df_fwd["input"] = df_fwd["input"].astype(str)
+        df_fwd["output"] = df_fwd["output"].astype(str)
         df_train = pd.concat([df_train, df_fwd], ignore_index=True)
         logger.info(f"After forward translation: {len(df_train)} rows.")
 
     # Back-translation + paraphrase
-    logger.info("Running back-translation + paraphrase …")
-    df_bt = back_translate_and_paraphrase(df_train, nllb_codes, cfg)
+    if back_path.exists():
+        logger.info(f"Resuming from existing back-translation checkpoint: {back_path}")
+        df_bt = pd.read_csv(back_path)
+    else:
+        logger.info("Running back-translation + paraphrase …")
+        df_bt = back_translate_and_paraphrase(df_train, nllb_codes, cfg)
+        df_bt.to_csv(back_path, index=False)
+        logger.success(f"Saved back-translation checkpoint → {back_path}")
+
+    df_bt["input"] = df_bt["input"].astype(str)
+    df_bt["output"] = df_bt["output"].astype(str)
     df_train = pd.concat([df_train, df_bt], ignore_index=True)
     logger.info(f"After back-translation: {len(df_train)} rows.")
 
